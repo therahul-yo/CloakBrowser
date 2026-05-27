@@ -830,6 +830,25 @@ docker stop cloak && docker rm cloak
 > The examples bind to `127.0.0.1` so only your machine can connect. Never expose port 9222
 > to the public internet without additional authentication.
 
+**Authentication (opt-in).** Pass `--auth-token=<secret>` (or set `CLOAKSERVE_AUTH_TOKEN`)
+to require a shared secret on every HTTP and WebSocket request. Clients send the token
+via `Authorization: Bearer <secret>` or as a `?token=<secret>` query param (which
+WebSocket clients can attach to the connect URL):
+
+```bash
+cloakserve --auth-token=$(openssl rand -hex 32) --host=0.0.0.0
+```
+
+```python
+TOKEN = "..."
+browser = pw.chromium.connect_over_cdp(
+    f"http://host:9222?fingerprint=42&token={TOKEN}"
+)
+```
+
+When `--host` is set to a non-loopback address without `--auth-token`, cloakserve
+logs a warning — the CDP surface should not be exposed to the network unauthenticated.
+
 ### Docker Compose
 
 ```yaml

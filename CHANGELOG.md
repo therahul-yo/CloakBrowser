@@ -8,6 +8,9 @@ Changes are tagged: **[wrapper]** for Python/JS wrapper, **[binary]** for Chromi
 
 ## [Unreleased]
 
+- **[wrapper]** `cloakserve`: opt-in `--auth-token=<secret>` (or `CLOAKSERVE_AUTH_TOKEN` env) gates all HTTP and WebSocket routes behind a shared secret using constant-time comparison. Token is accepted via `Authorization: Bearer` or `?token=` query string for WebSocket clients. The `token` query param is now reserved and never forwarded to Chrome, so the secret cannot leak into child process args (#248)
+- **[wrapper]** `cloakserve`: explicit `--host=<address>` overrides the container/bare-metal auto-detect. Logs a warning when binding to a non-loopback address without `--auth-token` (#248)
+
 ## [0.3.28] — 2026-05-11
 
 - **[wrapper]** **Security**: `cloakserve` — sanitize fingerprint seed to prevent path traversal, bind to `127.0.0.1` on bare metal, detect Podman containers (#217)

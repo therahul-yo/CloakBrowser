@@ -9,6 +9,8 @@ from unittest.mock import patch
 import pytest
 
 aiohttp = pytest.importorskip("aiohttp", reason="cloakserve requires aiohttp (install with .[serve])")
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 # Load cloakserve as a module from bin/ (no .py extension).
 _bin_path = str(Path(__file__).resolve().parents[1] / "bin" / "cloakserve")
@@ -24,6 +26,7 @@ ChromePool = _mod.ChromePool
 _default_data_dir = _mod._default_data_dir
 SAFE_SEED_RE = _mod.SAFE_SEED_RE
 RESERVED_SEEDS = _mod.RESERVED_SEEDS
+auth_middleware = _mod.auth_middleware
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +78,27 @@ class TestParseConnectionParams:
     def test_multiple_values_takes_first(self):
         result = parse_connection_params("fingerprint=111&fingerprint=222")
         assert result["seed"] == "111"
+
+    def test_token_param_not_forwarded_to_chrome(self):
+        """Auth token (?token=) must not leak into Chrome args as --fingerprint-token."""
+        result = parse_connection_params("fingerprint=1&token=s3cret")
+        assert result["seed"] == "1"
+        assert result["extra_args"] == []
+        # Defensive: nothing in extra_args should reference the secret
+        assert not any("s3cret" in arg for arg in result["extra_args"])
+        assert not any(arg.startswith("--fingerprint-token") for arg in result["extra_args"])
+
+    def test_token_param_alone(self):
+        result = parse_connection_params("token=s3cret")
+        assert result["extra_args"] == []
+        assert result["seed"] is None
+
+    def test_token_does_not_displace_other_generic_params(self):
+        qs = "fingerprint=1&token=s3cret&platform=windows&hardware-concurrency=8"
+        result = parse_connection_params(qs)
+        assert "--fingerprint-platform=windows" in result["extra_args"]
+        assert "--fingerprint-hardware-concurrency=8" in result["extra_args"]
+        assert not any("token" in arg for arg in result["extra_args"])
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +158,24 @@ class TestParseCliArgs:
     def test_default_data_dir_bare_metal(self, _mock):
         result = _default_data_dir()
         assert result.endswith(".cloakbrowser/cloakserve")
+
+    def test_auth_token_arg(self):
+        config, passthrough = parse_cli_args(["--auth-token=s3cret"])
+        assert config["auth_token"] == "s3cret"
+        assert not any(a.startswith("--auth-token") for a in passthrough)
+
+    def test_auth_token_default_none(self):
+        config, _ = parse_cli_args([])
+        assert config["auth_token"] is None
+
+    def test_host_arg(self):
+        config, passthrough = parse_cli_args(["--host=0.0.0.0"])
+        assert config["host"] == "0.0.0.0"
+        assert not any(a.startswith("--host=") for a in passthrough)
+
+    def test_host_default_none(self):
+        config, _ = parse_cli_args([])
+        assert config["host"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +380,108 @@ class TestSafeRmtree:
         pool._safe_rmtree(traversal)
 
         assert victim.exists(), "Traversal path must not be deleted"
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _make_auth_app(token: str | None):
+    """Build an aiohttp app with auth_middleware and a handler that exposes
+    what parse_connection_params() would forward to Chrome."""
+    middlewares = [auth_middleware] if token else []
+    app = web.Application(middlewares=middlewares)
+    if token:
+        app["auth_token"] = token
+
+    async def handler(request: web.Request) -> web.Response:
+        parsed = parse_connection_params(request.query_string)
+        return web.json_response({
+            "ok": True,
+            "extra_args": parsed["extra_args"],
+            "seed": parsed["seed"],
+        })
+
+    app.router.add_get("/json/version", handler)
+    return app
+
+
+class TestAuthMiddleware:
+    """End-to-end auth flow: gate routes behind a token without leaking it to Chrome."""
+
+    async def test_no_token_configured_allows_all(self):
+        app = _make_auth_app(token=None)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/json/version")
+            assert resp.status == 200
+
+    async def test_missing_token_rejected(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/json/version")
+            assert resp.status == 401
+            assert resp.headers.get("WWW-Authenticate") == "Bearer"
+
+    async def test_wrong_token_rejected(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/json/version",
+                headers={"Authorization": "Bearer wrong"},
+            )
+            assert resp.status == 401
+
+    async def test_wrong_query_token_rejected(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/json/version?token=wrong")
+            assert resp.status == 401
+
+    async def test_bearer_header_accepted(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/json/version?fingerprint=42",
+                headers={"Authorization": "Bearer s3cret"},
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["seed"] == "42"
+            assert body["extra_args"] == []
+
+    async def test_query_token_accepted_and_not_forwarded(self):
+        """Critical: when client auths via ?token=, the token must NOT be
+        forwarded to Chrome as --fingerprint-token=<secret>."""
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/json/version?fingerprint=42&token=s3cret&platform=windows"
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["seed"] == "42"
+            # platform passes through (legitimate fingerprint param)
+            assert "--fingerprint-platform=windows" in body["extra_args"]
+            # token must NOT leak through as --fingerprint-token=s3cret
+            assert not any("token" in arg for arg in body["extra_args"])
+            assert not any("s3cret" in arg for arg in body["extra_args"])
+
+    async def test_malformed_authorization_header_falls_through_to_query(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            # No "Bearer " prefix → ignored, query token used instead
+            resp = await client.get(
+                "/json/version?token=s3cret",
+                headers={"Authorization": "s3cret"},
+            )
+            assert resp.status == 200
+
+    async def test_empty_token_rejected(self):
+        app = _make_auth_app(token="s3cret")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/json/version",
+                headers={"Authorization": "Bearer "},
+            )
+            assert resp.status == 401

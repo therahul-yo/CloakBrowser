@@ -18,6 +18,7 @@ Client:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -325,7 +326,9 @@ class ChromePool:
 # ---------------------------------------------------------------------------
 
 # Params that need special handling (not simple --fingerprint-{name}= mapping)
-SPECIAL_PARAMS = {"fingerprint", "proxy", "geoip", "locale", "timezone"}
+# `token` is the auth credential for --auth-token; never forward it to Chrome
+# (would leak the secret into child process args via --fingerprint-token=).
+SPECIAL_PARAMS = {"fingerprint", "proxy", "geoip", "locale", "timezone", "token"}
 
 
 def parse_connection_params(query_string: str) -> dict:
@@ -358,6 +361,39 @@ def parse_connection_params(query_string: str) -> dict:
             result["extra_args"].append(f"--fingerprint-{key}={val}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Authentication middleware
+# ---------------------------------------------------------------------------
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    """Gate all routes behind a shared secret when --auth-token is configured.
+
+    Token is accepted via `Authorization: Bearer <token>` or `?token=<value>`
+    (the query-string form covers WebSocket clients that cannot set headers).
+    Comparisons use hmac.compare_digest to avoid timing leaks.
+    """
+    expected = request.app.get("auth_token")
+    if not expected:
+        return await handler(request)
+
+    provided: str | None = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided = auth_header[len("Bearer "):]
+    if provided is None:
+        provided = request.query.get("token")
+
+    if not provided or not hmac.compare_digest(provided, expected):
+        return web.json_response(
+            {"error": "Unauthorized"},
+            status=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await handler(request)
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +632,8 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
         "default_seed": None,
         "default_locale": None,
         "default_timezone": None,
+        "auth_token": None,
+        "host": None,
     }
     passthrough = []
     # Flags consumed by cloakserve (not passed to Chrome)
@@ -611,6 +649,10 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
             config["port"] = int(arg.split("=", 1)[1])
         elif arg.startswith("--data-dir="):
             config["data_dir"] = arg.split("=", 1)[1]
+        elif arg.startswith("--auth-token="):
+            config["auth_token"] = arg.split("=", 1)[1]
+        elif arg.startswith("--host="):
+            config["host"] = arg.split("=", 1)[1]
         elif arg == "--headless=false" or arg == "--headless=False":
             config["headless"] = False
             passthrough.append(arg)
@@ -657,9 +699,14 @@ def main() -> None:
         default_timezone=config["default_timezone"],
     )
 
-    app = web.Application()
+    auth_token = config["auth_token"] or os.environ.get("CLOAKSERVE_AUTH_TOKEN") or None
+    middlewares = [auth_middleware] if auth_token else []
+    app = web.Application(middlewares=middlewares)
     app["pool"] = pool
     app["port"] = config["port"]
+    if auth_token:
+        app["auth_token"] = auth_token
+        logger.info("Authentication enabled — token required on all routes")
 
     # Routes
     app.router.add_get("/", handle_root)
@@ -685,8 +732,20 @@ def main() -> None:
         port,
     )
 
-    in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-    host = "0.0.0.0" if in_container else "127.0.0.1"
+    if config["host"] is not None:
+        host = config["host"]
+    else:
+        in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+        host = "0.0.0.0" if in_container else "127.0.0.1"
+
+    if host not in ("127.0.0.1", "localhost", "::1") and not auth_token:
+        logger.warning(
+            "Binding to %s without --auth-token. CDP gives full browser control — "
+            "anyone who can reach this port can hijack browsers. "
+            "Set --auth-token=<secret> or CLOAKSERVE_AUTH_TOKEN.",
+            host,
+        )
+
     web.run_app(app, host=host, port=port, print=None)
 
 
